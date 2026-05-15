@@ -89,6 +89,7 @@ function SessionRoomInner({
   }, [initialBundle]);
 
   const pageVisible = usePageVisible();
+  const [sessionSocketSubscribed, setSessionSocketSubscribed] = React.useState(false);
   const pollMsFallback = 4_000;
   const query = useQuery({
     queryKey: ["session", sessionId],
@@ -114,20 +115,37 @@ function SessionRoomInner({
   const sessionLive = query.data?.status === "SCHEDULED" || query.data?.status === "ACTIVE";
 
   React.useLayoutEffect(() => {
-    if (!socket) return;
+    if (!socket) {
+      setSessionSocketSubscribed(false);
+      return;
+    }
+    let cancelled = false;
     const join = () => {
-      socket.emit(ClientToServerEvents.SESSION_SUBSCRIBE, { sessionId });
+      socket.emit(
+        ClientToServerEvents.SESSION_SUBSCRIBE,
+        { sessionId },
+        (ack: unknown) => {
+          if (cancelled) return;
+          const ok = typeof ack === "object" && ack !== null && "ok" in ack && (ack as { ok: boolean }).ok === true;
+          setSessionSocketSubscribed(ok);
+        },
+      );
     };
     if (!sessionLive) {
+      setSessionSocketSubscribed(false);
       if (socket.connected) {
         socket.emit(ClientToServerEvents.SESSION_UNSUBSCRIBE, { sessionId });
       }
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
     if (socket.connected) join();
     socket.on("connect", join);
     return () => {
+      cancelled = true;
       socket.off("connect", join);
+      setSessionSocketSubscribed(false);
       if (socket.connected) {
         socket.emit(ClientToServerEvents.SESSION_UNSUBSCRIBE, { sessionId });
       }
@@ -303,7 +321,14 @@ function SessionRoomInner({
             </Badge>
           </div>
         </div>
-        <SessionMediaRail className="mx-3 mt-2" sessionOpen={sessionLive} />
+        <SessionMediaRail
+          className="mx-3 mt-2"
+          sessionOpen={sessionLive}
+          sessionId={sessionId}
+          sessionSubscribed={sessionSocketSubscribed}
+          viewerId={data.viewerId}
+          peerUserId={data.viewerId === data.tutor.id ? data.student.id : data.tutor.id}
+        />
         <div className="flex items-center gap-2 border-b border-border px-4 py-2 text-xs text-muted-foreground">
           <Clock className="h-3.5 w-3.5 shrink-0" />
           <span className="font-mono tabular-nums">{formatElapsed(elapsed)}</span>
@@ -389,6 +414,7 @@ function SessionRoomInner({
               <SessionWhiteboard
                 sessionId={sessionId}
                 readOnly={data.status !== "SCHEDULED" && data.status !== "ACTIVE"}
+                socketSubscribed={sessionSocketSubscribed}
               />
             </CardContent>
           </Card>
