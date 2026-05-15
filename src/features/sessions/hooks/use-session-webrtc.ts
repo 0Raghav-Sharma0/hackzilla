@@ -81,7 +81,11 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
     icePendingRef.current = [];
     for (const c of q) {
       try {
-        await pc.addIceCandidate(c);
+        if (c == null || (typeof c.candidate === "string" && c.candidate.length === 0)) {
+          await pc.addIceCandidate(null);
+        } else {
+          await pc.addIceCandidate(c);
+        }
       } catch {
         /* ignore */
       }
@@ -139,8 +143,30 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
       emitIce(ev.candidate?.toJSON() ?? null);
     };
     pc.ontrack = (ev) => {
-      const [s] = ev.streams;
-      if (s) setRemoteStream(s);
+      const track = ev.track;
+      track.enabled = true;
+      track.onended = () => {
+        setRemoteStream((prev) => {
+          if (!prev) return null;
+          const live = prev.getTracks().filter((t) => t.id !== track.id && t.readyState === "live");
+          return live.length ? new MediaStream(live) : null;
+        });
+      };
+      /* Same underlying MediaStream can gain tracks without changing reference — always clone so React + <video> update. */
+      setRemoteStream((prev) => {
+        const keep = (prev?.getTracks() ?? []).filter((t) => t.id !== track.id && t.readyState === "live");
+        const fromEvent = ev.streams[0]?.getTracks().filter((t) => t.readyState === "live") ?? [];
+        const byId = new Map<string, MediaStreamTrack>();
+        for (const t of keep) byId.set(t.id, t);
+        for (const t of fromEvent) byId.set(t.id, t);
+        byId.set(track.id, track);
+        const bumpRemote = () => {
+          setRemoteStream((p) => (p ? new MediaStream([...p.getTracks()]) : null));
+        };
+        track.onunmute = bumpRemote;
+        track.onmute = bumpRemote;
+        return new MediaStream([...byId.values()]);
+      });
     };
     pc.onconnectionstatechange = () => {
       setPcState(pc.connectionState);
@@ -288,8 +314,13 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
     const onIce = (p: WebrtcIcePayload) => {
       if (p.sessionId !== sessionId || p.fromUserId !== remoteUserId) return;
       const cand = p.candidate;
-      if (!cand?.candidate) return;
       const pc = pcRef.current;
+      const endOfCandidates = cand == null || (typeof cand.candidate === "string" && cand.candidate.length === 0);
+      if (endOfCandidates) {
+        if (!pc?.remoteDescription) return;
+        void pc.addIceCandidate(null).catch(() => {});
+        return;
+      }
       if (!pc?.remoteDescription) {
         icePendingRef.current.push(cand);
         return;

@@ -41,25 +41,51 @@ export function SessionMediaRail({
 
   const mainVideoRef = React.useRef<HTMLVideoElement>(null);
   const pipVideoRef = React.useRef<HTMLVideoElement>(null);
+  const remoteAudioRef = React.useRef<HTMLAudioElement>(null);
+
+  const remoteLive = webrtc.remoteStream?.getTracks().some((t) => t.readyState === "live") ?? false;
 
   React.useEffect(() => {
-    const showRemote = !!webrtc.remoteStream;
     const main = mainVideoRef.current;
+    const audio = remoteAudioRef.current;
     if (!main) return;
-    main.srcObject = showRemote ? webrtc.remoteStream : webrtc.localPreviewStream;
-    main.muted = !showRemote;
+
+    if (remoteLive && webrtc.remoteStream) {
+      const rs = webrtc.remoteStream;
+      const hasRemoteVideo = rs.getVideoTracks().some((t) => t.readyState === "live");
+      main.srcObject = rs;
+      main.muted = false;
+      main.volume = 1;
+      if (audio) {
+        /* Same stream on video+audio can double-play remote audio in some engines — audio sink only when remote is audio-only. */
+        if (hasRemoteVideo) {
+          audio.srcObject = null;
+        } else {
+          audio.srcObject = rs;
+          audio.muted = false;
+          audio.volume = 1;
+        }
+      }
+    } else {
+      main.srcObject = webrtc.localPreviewStream;
+      main.muted = true;
+      if (audio) {
+        audio.srcObject = null;
+      }
+    }
+
     void main.play().catch(() => {});
-  }, [webrtc.remoteStream, webrtc.localPreviewStream]);
+    if (audio) void audio.play().catch(() => {});
+  }, [remoteLive, webrtc.remoteStream, webrtc.localPreviewStream]);
 
   React.useEffect(() => {
     const pip = pipVideoRef.current;
     if (!pip) return;
-    const showRemote = !!webrtc.remoteStream;
-    const pipStream = showRemote ? webrtc.localPreviewStream : null;
+    const pipStream = remoteLive ? webrtc.localPreviewStream : null;
     pip.srcObject = pipStream;
     pip.muted = true;
     void pip.play().catch(() => {});
-  }, [webrtc.remoteStream, webrtc.localPreviewStream]);
+  }, [remoteLive, webrtc.localPreviewStream]);
 
   React.useEffect(() => {
     if (webrtc.lastError && !webrtc.lastError.startsWith("Waiting")) {
@@ -69,7 +95,7 @@ export function SessionMediaRail({
   }, [webrtc.lastError, webrtc.setLastError]);
 
   const mediaOn = webrtc.voiceActive || webrtc.screenActive || webrtc.cameraActive;
-  const showRemote = !!webrtc.remoteStream;
+  const showRemote = remoteLive;
   const hasMainPreview = showRemote || !!webrtc.localPreviewStream;
 
   const statusLabel = !connected
@@ -101,6 +127,8 @@ export function SessionMediaRail({
       >
         {hasMainPreview ? (
           <>
+            {/* Hidden audio sink: some browsers play WebRTC remote audio more reliably alongside video. */}
+            <audio ref={remoteAudioRef} className="hidden" playsInline autoPlay />
             <video ref={mainVideoRef} className="h-full w-full object-contain" playsInline autoPlay />
             <video
               ref={pipVideoRef}
