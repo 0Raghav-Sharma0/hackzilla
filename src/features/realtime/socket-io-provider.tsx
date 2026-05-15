@@ -32,7 +32,7 @@ export function SocketIoProvider({ children }: { children: React.ReactNode }) {
       if (cancelled || !json.ok || !json.data?.token || !json.data.socketUrl) return;
 
       s = io(json.data.socketUrl, {
-        transports: ["websocket"],
+        transports: ["polling", "websocket"],
         auth: { token: json.data.token },
         reconnection: true,
         reconnectionAttempts: 12,
