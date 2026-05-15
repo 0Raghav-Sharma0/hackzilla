@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Mic, Video, Monitor, Volume2 } from "lucide-react";
+import { Mic, Video, Volume2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { useSocketIo } from "@/features/realtime/socket-io-provider";
@@ -12,6 +12,7 @@ type SessionMediaRailProps = {
   className?: string;
   sessionOpen?: boolean;
   sessionId: string;
+  /** `session:subscribe` ack — room join on the socket server. */
   sessionSubscribed: boolean;
   viewerId: string;
   peerUserId: string;
@@ -26,93 +27,123 @@ export function SessionMediaRail({
   peerUserId,
 }: SessionMediaRailProps) {
   const { socket, connected } = useSocketIo();
+  const signalingReady = sessionOpen && connected && sessionSubscribed;
+
   const webrtc = useSessionWebrtc({
     sessionId,
     localUserId: viewerId,
     remoteUserId: peerUserId,
-    socket,
-    sessionSubscribed: sessionOpen && sessionSubscribed && connected,
+    socket: socket ?? null,
+    roomSubscribed: sessionSubscribed,
+    signalingReady,
     enabled: sessionOpen,
   });
 
-  const remoteVideoRef = React.useRef<HTMLVideoElement>(null);
+  const mainVideoRef = React.useRef<HTMLVideoElement>(null);
+  const pipVideoRef = React.useRef<HTMLVideoElement>(null);
 
   React.useEffect(() => {
-    const el = remoteVideoRef.current;
-    if (!el) return;
-    el.srcObject = webrtc.remoteStream;
-    void el.play().catch(() => {});
-  }, [webrtc.remoteStream]);
+    const showRemote = !!webrtc.remoteStream;
+    const main = mainVideoRef.current;
+    if (!main) return;
+    main.srcObject = showRemote ? webrtc.remoteStream : webrtc.localPreviewStream;
+    main.muted = !showRemote;
+    void main.play().catch(() => {});
+  }, [webrtc.remoteStream, webrtc.localPreviewStream]);
 
   React.useEffect(() => {
-    if (!webrtc.lastError) return;
-    if (!webrtc.lastError.startsWith("Waiting")) {
+    const pip = pipVideoRef.current;
+    if (!pip) return;
+    const showRemote = !!webrtc.remoteStream;
+    const pipStream = showRemote ? webrtc.localPreviewStream : null;
+    pip.srcObject = pipStream;
+    pip.muted = true;
+    void pip.play().catch(() => {});
+  }, [webrtc.remoteStream, webrtc.localPreviewStream]);
+
+  React.useEffect(() => {
+    if (webrtc.lastError && !webrtc.lastError.startsWith("Waiting")) {
       toast.error(webrtc.lastError);
     }
     webrtc.setLastError(null);
   }, [webrtc.lastError, webrtc.setLastError]);
 
+  const mediaOn = webrtc.voiceActive || webrtc.screenActive || webrtc.cameraActive;
+  const showRemote = !!webrtc.remoteStream;
+  const hasMainPreview = showRemote || !!webrtc.localPreviewStream;
+
   const statusLabel = !connected
-    ? "Realtime offline"
+    ? mediaOn
+      ? "Local preview — realtime offline"
+      : "Realtime offline"
     : !sessionSubscribed
       ? "Joining room…"
-      : webrtc.voiceActive || webrtc.screenActive
+      : mediaOn
         ? webrtc.peerReady
           ? `Call · ${webrtc.pcState}`
-          : "Waiting for peer…"
-        : "Voice & screen off";
+          : signalingReady
+            ? "Waiting for peer…"
+            : "Local preview only"
+        : "Voice & video off";
 
   return (
-    <div
-      className={cn(
-        "flex flex-col gap-2 rounded-xl border border-border/60 bg-muted/15 px-3 py-2",
-        !sessionOpen && "pointer-events-none opacity-50",
-        className,
-      )}
-    >
-      <div className="flex flex-wrap items-center gap-2">
+    <div className={cn("flex flex-col gap-2 rounded-lg border bg-muted/30 p-3", className)}>
+      <div className="flex items-center justify-between gap-2">
         <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Session A/V</span>
-        <span className="text-[10px] text-muted-foreground">{statusLabel}</span>
+        <span className="max-w-[60%] text-right text-[10px] text-muted-foreground">{statusLabel}</span>
       </div>
+
+      <div
+        className={cn(
+          "relative w-full overflow-hidden rounded-md border border-border/60 bg-black/[0.06] dark:bg-black/50",
+          "aspect-video max-h-[min(40vh,320px)]",
+        )}
+      >
+        {hasMainPreview ? (
+          <>
+            <video ref={mainVideoRef} className="h-full w-full object-contain" playsInline autoPlay />
+            <video
+              ref={pipVideoRef}
+              className={cn(
+                "absolute bottom-2 right-2 aspect-video w-[28%] min-w-[96px] max-w-[200px] overflow-hidden rounded-md border-2 border-background object-cover shadow-md",
+                !showRemote && "hidden",
+              )}
+              playsInline
+              autoPlay
+            />
+          </>
+        ) : (
+          <div className="flex h-full min-h-[140px] flex-col items-center justify-center gap-1 px-4 text-center text-[11px] text-muted-foreground">
+            <Volume2 className="h-6 w-6 opacity-40" aria-hidden />
+            <span>Turn on mic or camera to preview. Remote video appears here when your partner connects.</span>
+          </div>
+        )}
+      </div>
+
       <div className="flex flex-wrap items-center gap-2">
         <Button
           type="button"
           size="sm"
           variant={webrtc.voiceActive ? "default" : "outline"}
           className="h-8 gap-1"
-          disabled={!sessionOpen || !connected}
+          disabled={!sessionOpen}
           onClick={() => void webrtc.toggleVoice()}
         >
           <Mic className="h-3.5 w-3.5" />
           {webrtc.voiceActive ? "Mic on" : "Mic off"}
         </Button>
+
         <Button
           type="button"
           size="sm"
-          variant={webrtc.screenActive ? "default" : "outline"}
+          variant={webrtc.cameraActive ? "default" : "outline"}
           className="h-8 gap-1"
-          disabled={!sessionOpen || !connected}
-          onClick={() => void webrtc.toggleScreen()}
+          disabled={!sessionOpen}
+          onClick={() => void webrtc.toggleCamera()}
         >
-          <Monitor className="h-3.5 w-3.5" />
-          {webrtc.screenActive ? "Sharing" : "Share screen"}
+          <Video className="h-3.5 w-3.5" />
+          {webrtc.cameraActive ? "Camera on" : "Camera off"}
         </Button>
-        <div className="flex items-center gap-1 rounded-md border border-border/50 bg-background/40 px-2 py-1 text-[10px] text-muted-foreground">
-          <Volume2 className="h-3 w-3 shrink-0" />
-          <span className="max-w-[10rem] truncate sm:max-w-[14rem]">Peer audio/video plays here when connected.</span>
-        </div>
-      </div>
-      <div className="flex items-start gap-2">
-        <video
-          ref={remoteVideoRef}
-          className="max-h-32 w-full max-w-md rounded-md border border-border/60 bg-black/80 object-contain sm:max-h-40"
-          playsInline
-          autoPlay
-          controls={false}
-        />
-        <div className="hidden shrink-0 items-center gap-1 text-muted-foreground sm:flex" aria-hidden>
-          <Video className="h-8 w-8 opacity-30" />
-        </div>
       </div>
     </div>
   );

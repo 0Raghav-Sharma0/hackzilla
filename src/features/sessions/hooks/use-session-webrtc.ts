@@ -27,7 +27,10 @@ export type UseSessionWebrtcOpts = {
   localUserId: string;
   remoteUserId: string;
   socket: Socket | null;
-  sessionSubscribed: boolean;
+  /** Room ack from socket server (session:subscribe). */
+  roomSubscribed: boolean;
+  /** Socket connected + room subscribed — WebRTC signaling only when true; mic/camera still work locally when false. */
+  signalingReady: boolean;
   enabled: boolean;
 };
 
@@ -36,12 +39,14 @@ export type UseSessionWebrtcOpts = {
  * Uses public STUN; add TURN via NEXT_PUBLIC_WEBRTC_ICE_SERVERS for strict NATs.
  */
 export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
-  const { sessionId, localUserId, remoteUserId, socket, sessionSubscribed, enabled } = opts;
-
+  const { sessionId, localUserId, remoteUserId, socket, roomSubscribed, signalingReady, enabled } = opts;
   const [voiceActive, setVoiceActive] = React.useState(false);
   const [screenActive, setScreenActive] = React.useState(false);
+  const [cameraActive, setCameraActive] = React.useState(false);
   const [peerReady, setPeerReady] = React.useState(false);
   const [remoteStream, setRemoteStream] = React.useState<MediaStream | null>(null);
+  /** Local mic/camera/screen for preview when offline or before the peer connects. */
+  const [localPreviewStream, setLocalPreviewStream] = React.useState<MediaStream | null>(null);
   const [pcState, setPcState] = React.useState<RTCPeerConnectionState | "new">("new");
   const [lastError, setLastError] = React.useState<string | null>(null);
 
@@ -54,18 +59,22 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
   const icePendingRef = React.useRef<RTCIceCandidateInit[]>([]);
   const pendingOfferSdpRef = React.useRef<string | null>(null);
   const voiceActiveRef = React.useRef(false);
+  const cameraActiveRef = React.useRef(false);
   const screenActiveRef = React.useRef(false);
-  const sessionSubscribedRef = React.useRef(sessionSubscribed);
+  const roomSubscribedRef = React.useRef(roomSubscribed);
+  const signalingReadyRef = React.useRef(signalingReady);
   const socketRef = React.useRef(socket);
   const sessionIdRef = React.useRef(sessionId);
 
   React.useEffect(() => {
-    sessionSubscribedRef.current = sessionSubscribed;
+    roomSubscribedRef.current = roomSubscribed;
+    signalingReadyRef.current = signalingReady;
     socketRef.current = socket;
     sessionIdRef.current = sessionId;
     voiceActiveRef.current = voiceActive;
+    cameraActiveRef.current = cameraActive;
     screenActiveRef.current = screenActive;
-  }, [sessionSubscribed, socket, sessionId, voiceActive, screenActive]);
+  }, [roomSubscribed, signalingReady, socket, sessionId, voiceActive, cameraActive, screenActive]);
 
   const flushIce = React.useCallback(async (pc: RTCPeerConnection) => {
     const q = [...icePendingRef.current];
@@ -108,11 +117,14 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
     peerReadyRef.current = false;
     setScreenActive(false);
     screenActiveRef.current = false;
+    setCameraActive(false);
+    cameraActiveRef.current = false;
+    setLocalPreviewStream(null);
   }, []);
 
   const emitIce = React.useCallback((candidate: RTCIceCandidateInit | null) => {
     const s = socketRef.current;
-    if (!s?.connected || !sessionSubscribedRef.current) return;
+    if (!s?.connected || !signalingReadyRef.current) return;
     s.emit(ClientToServerEvents.WEBRTC_ICE, {
       sessionId: sessionIdRef.current,
       candidate,
@@ -134,7 +146,7 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
       setPcState(pc.connectionState);
     };
     pc.onnegotiationneeded = () => {
-      if (!sessionSubscribedRef.current) return;
+      if (!signalingReadyRef.current) return;
       const s = socketRef.current;
       if (!s?.connected || !pcRef.current) return;
       if (offerLockRef.current) return;
@@ -162,7 +174,7 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
   const sendPoliteOffer = React.useCallback(async () => {
     const pc = pcRef.current;
     const s = socketRef.current;
-    if (!polite || !pc || !s?.connected || !sessionSubscribedRef.current) return;
+    if (!polite || !pc || !s?.connected || !signalingReadyRef.current) return;
     if (!peerReadyRef.current) return;
     if (pc.signalingState !== "stable") return;
     if (pc.remoteDescription) return;
@@ -185,13 +197,13 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
 
   const handleRemoteOffer = React.useCallback(
     async (sdp: string) => {
-      if (!voiceActiveRef.current && !screenActiveRef.current) {
+      if (!voiceActiveRef.current && !screenActiveRef.current && !cameraActiveRef.current) {
         pendingOfferSdpRef.current = sdp;
         return;
       }
       const pc = ensurePc();
       const s = socketRef.current;
-      if (!s?.connected || !sessionSubscribedRef.current) {
+      if (!s?.connected || !signalingReadyRef.current) {
         pendingOfferSdpRef.current = sdp;
         return;
       }
@@ -226,8 +238,31 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
     }
   }, [enabled, teardownPc]);
 
+  const syncLocalTracksToPc = React.useCallback(() => {
+    const base = localStreamRef.current;
+    const s = socketRef.current;
+    if (!base || !s?.connected || !signalingReadyRef.current) return;
+    const pc = ensurePc();
+    for (const t of base.getTracks()) {
+      if (!pc.getSenders().some((sender) => sender.track === t)) {
+        try {
+          pc.addTrack(t, base);
+        } catch {
+          /* ignore duplicate */
+        }
+      }
+    }
+    s.emit(ClientToServerEvents.WEBRTC_READY, { sessionId: sessionIdRef.current });
+  }, [ensurePc]);
+
   React.useEffect(() => {
-    if (!socket || !sessionSubscribed) return;
+    if (!signalingReady) return;
+    if (!voiceActive && !cameraActive && !screenActive) return;
+    syncLocalTracksToPc();
+  }, [signalingReady, voiceActive, cameraActive, screenActive, syncLocalTracksToPc]);
+
+  React.useEffect(() => {
+    if (!socket || !roomSubscribed) return;
 
     const onPeerReady = (p: WebrtcPeerReadyPayload) => {
       if (p.sessionId !== sessionId || p.userId !== remoteUserId) return;
@@ -270,14 +305,15 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
       socket.off(ServerToClientEvents.WEBRTC_SIGNAL, onSignal);
       socket.off(ServerToClientEvents.WEBRTC_ICE, onIce);
     };
-  }, [socket, sessionSubscribed, sessionId, remoteUserId, handleRemoteOffer, handleRemoteAnswer]);
+  }, [socket, roomSubscribed, sessionId, remoteUserId, handleRemoteOffer, handleRemoteAnswer]);
 
   React.useEffect(() => {
-    if (!polite || !peerReady || !voiceActive || !sessionSubscribed || !socket?.connected) return;
+    const mediaOn = voiceActive || cameraActive || screenActive;
+    if (!polite || !peerReady || !mediaOn || !signalingReady) return;
     const pc = pcRef.current;
     if (!pc || pc.remoteDescription) return;
     void sendPoliteOffer();
-  }, [polite, peerReady, voiceActive, sessionSubscribed, socket, sendPoliteOffer]);
+  }, [polite, peerReady, voiceActive, cameraActive, screenActive, signalingReady, sendPoliteOffer]);
 
   const stopVoice = React.useCallback(() => {
     setVoiceActive(false);
@@ -286,11 +322,14 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
     setLastError(null);
   }, [teardownPc]);
 
+  const stopCamera = React.useCallback(() => {
+    setCameraActive(false);
+    cameraActiveRef.current = false;
+    teardownPc();
+    setLastError(null);
+  }, [teardownPc]);
+
   const startVoice = React.useCallback(async () => {
-    if (!sessionSubscribed || !socket?.connected) {
-      setLastError("Waiting for live session connection…");
-      return;
-    }
     setLastError(null);
     try {
       const mic = await navigator.mediaDevices.getUserMedia({
@@ -299,26 +338,76 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
       });
       const base = localStreamRef.current ?? new MediaStream();
       localStreamRef.current = base;
-      const pc = ensurePc();
       for (const t of mic.getAudioTracks()) {
         base.addTrack(t);
-        pc.addTrack(t, base);
       }
+      setLocalPreviewStream(new MediaStream(base.getTracks()));
       setVoiceActive(true);
       voiceActiveRef.current = true;
-      socket.emit(ClientToServerEvents.WEBRTC_READY, { sessionId });
 
-      if (pendingOfferSdpRef.current) {
-        const sdp = pendingOfferSdpRef.current;
-        pendingOfferSdpRef.current = null;
-        await handleRemoteOffer(sdp);
-      } else if (polite && peerReadyRef.current) {
-        await sendPoliteOffer();
+      if (signalingReadyRef.current && socketRef.current?.connected) {
+        const pc = ensurePc();
+        for (const t of mic.getAudioTracks()) {
+          if (!pc.getSenders().some((sender) => sender.track === t)) pc.addTrack(t, base);
+        }
+        socketRef.current.emit(ClientToServerEvents.WEBRTC_READY, { sessionId: sessionIdRef.current });
+        if (pendingOfferSdpRef.current) {
+          const sdp = pendingOfferSdpRef.current;
+          pendingOfferSdpRef.current = null;
+          await handleRemoteOffer(sdp);
+        } else if (polite && peerReadyRef.current) {
+          await sendPoliteOffer();
+        }
+      } else {
+        setLastError(
+          "Waiting for peer — local mic only. Run `npm run dev:realtime` (or deploy the socket server) to connect with your partner.",
+        );
       }
     } catch (e) {
       setLastError(e instanceof Error ? e.message : "Microphone permission denied");
     }
-  }, [sessionSubscribed, socket, sessionId, ensurePc, handleRemoteOffer, sendPoliteOffer]);
+  }, [ensurePc, handleRemoteOffer, sendPoliteOffer, polite]);
+
+  const startCamera = React.useCallback(async () => {
+    setLastError(null);
+    try {
+      const cam = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      const base = localStreamRef.current ?? new MediaStream();
+      localStreamRef.current = base;
+      for (const t of cam.getVideoTracks()) {
+        base.addTrack(t);
+      }
+      setLocalPreviewStream(new MediaStream(base.getTracks()));
+      setCameraActive(true);
+      cameraActiveRef.current = true;
+
+      if (signalingReadyRef.current && socketRef.current?.connected) {
+        const pc = ensurePc();
+        for (const t of cam.getVideoTracks()) {
+          if (!pc.getSenders().some((sender) => sender.track === t)) pc.addTrack(t, base);
+        }
+        socketRef.current.emit(ClientToServerEvents.WEBRTC_READY, { sessionId: sessionIdRef.current });
+        if (pendingOfferSdpRef.current) {
+          const sdp = pendingOfferSdpRef.current;
+          pendingOfferSdpRef.current = null;
+          await handleRemoteOffer(sdp);
+        } else if (polite && peerReadyRef.current) {
+          await sendPoliteOffer();
+        }
+      } else {
+        setLastError(
+          "Waiting for peer — local camera only. Connect realtime to share video with your partner.",
+        );
+      }
+    } catch (e) {
+      setLastError(e instanceof Error ? e.message : "Camera permission denied");
+    }
+  }, [ensurePc, handleRemoteOffer, sendPoliteOffer, polite]);
+
+  const toggleCamera = React.useCallback(() => {
+    if (cameraActive) stopCamera();
+    else void startCamera();
+  }, [cameraActive, stopCamera, startCamera]);
 
   const toggleVoice = React.useCallback(() => {
     if (voiceActive) stopVoice();
@@ -331,6 +420,15 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
       screenSendersRef.current = [];
       setScreenActive(false);
       screenActiveRef.current = false;
+      const liveNoPc = localStreamRef.current?.getTracks().filter((t) => t.readyState === "live") ?? [];
+      if (liveNoPc.length) {
+        const fresh = new MediaStream(liveNoPc);
+        localStreamRef.current = fresh;
+        setLocalPreviewStream(fresh);
+      } else {
+        setLocalPreviewStream(null);
+        localStreamRef.current = null;
+      }
       return;
     }
     for (const sender of screenSendersRef.current) {
@@ -345,38 +443,56 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
     screenSendersRef.current = [];
     setScreenActive(false);
     screenActiveRef.current = false;
+    const live = localStreamRef.current?.getTracks().filter((t) => t.readyState === "live") ?? [];
+    if (live.length) {
+      const fresh = new MediaStream(live);
+      localStreamRef.current = fresh;
+      setLocalPreviewStream(fresh);
+    } else {
+      setLocalPreviewStream(null);
+      localStreamRef.current = null;
+    }
   }, []);
 
   const startScreen = React.useCallback(async () => {
-    if (!sessionSubscribed || !socket?.connected) {
-      setLastError("Waiting for live session connection…");
-      return;
-    }
     setLastError(null);
     try {
       const display = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: { max: 30 } },
         audio: true,
       });
-      const pc = ensurePc();
       const base = localStreamRef.current ?? new MediaStream();
-      if (!localStreamRef.current) localStreamRef.current = base;
+      localStreamRef.current = base;
+
+      if (!signalingReadyRef.current || !socketRef.current?.connected) {
+        for (const t of display.getTracks()) {
+          t.stop();
+        }
+        setLastError(
+          "Waiting for peer — screen share needs the socket server. Run `npm run dev:realtime` or deploy the socket host.",
+        );
+        return;
+      }
+
+      const pc = ensurePc();
       const senders: RTCRtpSender[] = [];
       for (const t of display.getTracks()) {
+        base.addTrack(t);
         const sender = pc.addTrack(t, base);
         senders.push(sender);
         t.addEventListener("ended", () => {
           stopScreen();
         });
       }
+      setLocalPreviewStream(new MediaStream(base.getTracks()));
       screenSendersRef.current = senders;
       setScreenActive(true);
       screenActiveRef.current = true;
-      socket.emit(ClientToServerEvents.WEBRTC_READY, { sessionId });
+      socketRef.current!.emit(ClientToServerEvents.WEBRTC_READY, { sessionId: sessionIdRef.current });
     } catch (e) {
       setLastError(e instanceof Error ? e.message : "Screen sharing was cancelled or blocked");
     }
-  }, [sessionSubscribed, socket, sessionId, ensurePc, stopScreen]);
+  }, [ensurePc, stopScreen]);
 
   const toggleScreen = React.useCallback(() => {
     if (screenActive) stopScreen();
@@ -386,12 +502,15 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
   return {
     voiceActive,
     screenActive,
+    cameraActive,
     peerReady,
     remoteStream,
+    localPreviewStream,
     pcState,
     lastError,
     setLastError,
     toggleVoice,
+    toggleCamera,
     toggleScreen,
     stopVoice,
   };

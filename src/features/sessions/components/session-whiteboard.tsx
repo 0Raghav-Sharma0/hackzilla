@@ -33,6 +33,8 @@ export function SessionWhiteboard({
   const [colorIdx, setColorIdx] = React.useState(0);
   const drawing = React.useRef(false);
   const activePointerId = React.useRef<number | null>(null);
+  /** Authoritative in-progress stroke (state can lag one frame on pointer-up). */
+  const activeDraftRef = React.useRef<Stroke | null>(null);
 
   const redraw = React.useCallback((list: Stroke[], partial: Stroke | null) => {
     const canvas = canvasRef.current;
@@ -57,9 +59,17 @@ export function SessionWhiteboard({
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     const paint = (stroke: Stroke) => {
-      if (stroke.points.length < 2) return;
+      if (stroke.points.length < 1) return;
       ctx.strokeStyle = stroke.color;
       ctx.lineWidth = stroke.width;
+      if (stroke.points.length === 1) {
+        const p = stroke.points[0];
+        ctx.fillStyle = stroke.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, Math.max(stroke.width * 0.85, 2), 0, Math.PI * 2);
+        ctx.fill();
+        return;
+      }
       ctx.beginPath();
       ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
       for (let i = 1; i < stroke.points.length; i++) {
@@ -120,6 +130,7 @@ export function SessionWhiteboard({
     const onRemoteClear = (p: { sessionId: string }) => {
       if (p.sessionId !== sessionId) return;
       setStrokes([]);
+      activeDraftRef.current = null;
       setDraft(null);
     };
     socket.on(ServerToClientEvents.WB_STROKE, onRemoteStroke);
@@ -130,7 +141,7 @@ export function SessionWhiteboard({
     };
   }, [socket, sessionId, socket?.connected]);
 
-  function clientPoint(ev: React.PointerEvent) {
+  function clientPoint(ev: { clientX: number; clientY: number }) {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
     const r = canvas.getBoundingClientRect();
@@ -142,36 +153,36 @@ export function SessionWhiteboard({
       if (!drawing.current) return;
       const canvas = canvasRef.current;
       if (!canvas) return;
-      setDraft((currentDraft) => {
-        if (!currentDraft) {
-          drawing.current = false;
-          return null;
+
+      const snap = activeDraftRef.current;
+      drawing.current = false;
+      activeDraftRef.current = null;
+
+      try {
+        if (activePointerId.current === ev.pointerId) {
+          canvas.releasePointerCapture(ev.pointerId);
+          activePointerId.current = null;
         }
-        drawing.current = false;
-        try {
-          if (activePointerId.current === ev.pointerId) {
-            canvas.releasePointerCapture(ev.pointerId);
-            activePointerId.current = null;
-          }
-        } catch {
-          /* ignore */
-        }
-        const finished = { ...currentDraft, points: currentDraft.points };
-        if (finished.points.length >= 2) {
-          setStrokes((prev) => [...prev, finished]);
-          const canEmit = socket?.connected && socketSubscribed;
-          if (canEmit) {
-            socket.emit(ClientToServerEvents.WB_STROKE, { sessionId, stroke: finished } satisfies WhiteboardStrokePayload);
-          }
-        }
-        return null;
-      });
+      } catch {
+        /* ignore */
+      }
+
+      setDraft(null);
+
+      if (!snap || snap.points.length < 1) return;
+      const finished: Stroke = { ...snap, points: [...snap.points] };
+      setStrokes((prev) => [...prev, finished]);
+      const canEmit = socket?.connected && socketSubscribed;
+      if (canEmit) {
+        socket.emit(ClientToServerEvents.WB_STROKE, { sessionId, stroke: finished } satisfies WhiteboardStrokePayload);
+      }
     },
     [sessionId, socket, socketSubscribed],
   );
 
   function onPointerDown(ev: React.PointerEvent<HTMLCanvasElement>) {
     if (readOnly) return;
+    ev.preventDefault();
     try {
       ev.currentTarget.setPointerCapture(ev.pointerId);
       activePointerId.current = ev.pointerId;
@@ -180,18 +191,24 @@ export function SessionWhiteboard({
     }
     const p = clientPoint(ev);
     drawing.current = true;
-    setDraft({
+    const stroke: Stroke = {
       id: crypto.randomUUID(),
       color: COLORS[colorIdx % COLORS.length],
       width: 2.4,
       points: [p],
-    });
+    };
+    activeDraftRef.current = stroke;
+    setDraft(stroke);
   }
 
   function onPointerMove(ev: React.PointerEvent<HTMLCanvasElement>) {
     if (!drawing.current || readOnly) return;
+    const cur = activeDraftRef.current;
+    if (!cur) return;
     const p = clientPoint(ev);
-    setDraft((d) => (d ? { ...d, points: [...d.points, p] } : d));
+    const next: Stroke = { ...cur, points: [...cur.points, p] };
+    activeDraftRef.current = next;
+    setDraft(next);
   }
 
   function onPointerUp(ev: React.PointerEvent<HTMLCanvasElement>) {
@@ -215,8 +232,12 @@ export function SessionWhiteboard({
     const move = (ev: PointerEvent) => {
       if (!drawing.current || readOnly) return;
       if (activePointerId.current != null && ev.pointerId !== activePointerId.current) return;
+      const cur = activeDraftRef.current;
+      if (!cur) return;
       const p = clientPoint(toCanvasEvent(ev));
-      setDraft((d) => (d && drawing.current ? { ...d, points: [...d.points, p] } : d));
+      const next: Stroke = { ...cur, points: [...cur.points, p] };
+      activeDraftRef.current = next;
+      setDraft(next);
     };
     const up = (ev: PointerEvent) => {
       if (activePointerId.current != null && ev.pointerId !== activePointerId.current) return;
@@ -236,6 +257,8 @@ export function SessionWhiteboard({
 
   function clearBoard() {
     setStrokes([]);
+    activeDraftRef.current = null;
+    drawing.current = false;
     setDraft(null);
     if (socket?.connected && socketSubscribed) {
       socket.emit(ClientToServerEvents.WB_CLEAR, { sessionId });
@@ -328,7 +351,7 @@ export function SessionWhiteboard({
         <canvas
           ref={canvasRef}
           className={cn(
-            "absolute inset-0 h-full w-full touch-none",
+            "absolute inset-0 z-[1] h-full w-full touch-none select-none",
             readOnly ? "cursor-default opacity-90" : "cursor-crosshair",
           )}
           onPointerDown={onPointerDown}
