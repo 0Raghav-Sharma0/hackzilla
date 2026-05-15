@@ -20,6 +20,10 @@ export const ClientToServerEvents = {
   /** Collaborative session whiteboard — relayed to peers in the same session room. */
   WB_STROKE: "wb:stroke",
   WB_CLEAR: "wb:clear",
+  /** WebRTC signaling — relayed only to peers in the same session room (after session:subscribe). */
+  WEBRTC_READY: "webrtc:ready",
+  WEBRTC_SIGNAL: "webrtc:signal",
+  WEBRTC_ICE: "webrtc:ice",
   MESSAGE_SEND: "message:send",
   MESSAGE_TYPING: "message:typing",
 
@@ -52,6 +56,9 @@ export const ServerToClientEvents = {
   RT_INVALIDATE: "rt:invalidate",
   WB_STROKE: "wb:stroke",
   WB_CLEAR: "wb:clear",
+  WEBRTC_PEER_READY: "webrtc:peer_ready",
+  WEBRTC_SIGNAL: "webrtc:signal",
+  WEBRTC_ICE: "webrtc:ice",
 } as const;
 
 /** Example payload shapes — mirror in Zod on the socket server ingress. */
@@ -84,6 +91,24 @@ export type NotificationNewPayload = {
 export type WhiteboardStrokePayload = {
   sessionId: string;
   stroke: { id: string; color: string; width: number; points: { x: number; y: number }[] };
+};
+
+export type WebrtcPeerReadyPayload = {
+  sessionId: string;
+  userId: string;
+};
+
+export type WebrtcSignalPayload = {
+  sessionId: string;
+  fromUserId: string;
+  type: "offer" | "answer";
+  sdp: string;
+};
+
+export type WebrtcIcePayload = {
+  sessionId: string;
+  fromUserId: string;
+  candidate: RTCIceCandidateInit | null;
 };
 
 /** Pushed to `session:{sessionId}` after Prisma insert — clients merge without refetch. */
