@@ -15,10 +15,13 @@ const COLORS = ["#38bdf8", "#a78bfa", "#f472b6", "#fbbf24", "#34d399"];
 export function SessionWhiteboard({
   sessionId,
   readOnly,
+  socketSubscribed = false,
 }: {
   sessionId: string;
   /** When session is not live, drawing is disabled. */
   readOnly: boolean;
+  /** After `session:subscribe` ack — avoids strokes dropped before the socket room join completes. */
+  socketSubscribed?: boolean;
 }) {
   const { socket, connected } = useSocketIo();
   const fullscreenRootRef = React.useRef<HTMLDivElement>(null);
@@ -29,6 +32,7 @@ export function SessionWhiteboard({
   const [isFullscreen, setIsFullscreen] = React.useState(false);
   const [colorIdx, setColorIdx] = React.useState(0);
   const drawing = React.useRef(false);
+  const activePointerId = React.useRef<number | null>(null);
 
   const redraw = React.useCallback((list: Stroke[], partial: Stroke | null) => {
     const canvas = canvasRef.current;
@@ -133,9 +137,47 @@ export function SessionWhiteboard({
     return { x: ev.clientX - r.left, y: ev.clientY - r.top };
   }
 
+  const finishStroke = React.useCallback(
+    (ev: Pick<React.PointerEvent<HTMLCanvasElement>, "pointerId" | "currentTarget">) => {
+      if (!drawing.current) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      setDraft((currentDraft) => {
+        if (!currentDraft) {
+          drawing.current = false;
+          return null;
+        }
+        drawing.current = false;
+        try {
+          if (activePointerId.current === ev.pointerId) {
+            canvas.releasePointerCapture(ev.pointerId);
+            activePointerId.current = null;
+          }
+        } catch {
+          /* ignore */
+        }
+        const finished = { ...currentDraft, points: currentDraft.points };
+        if (finished.points.length >= 2) {
+          setStrokes((prev) => [...prev, finished]);
+          const canEmit = socket?.connected && socketSubscribed;
+          if (canEmit) {
+            socket.emit(ClientToServerEvents.WB_STROKE, { sessionId, stroke: finished } satisfies WhiteboardStrokePayload);
+          }
+        }
+        return null;
+      });
+    },
+    [sessionId, socket, socketSubscribed],
+  );
+
   function onPointerDown(ev: React.PointerEvent<HTMLCanvasElement>) {
     if (readOnly) return;
-    ev.currentTarget.setPointerCapture(ev.pointerId);
+    try {
+      ev.currentTarget.setPointerCapture(ev.pointerId);
+      activePointerId.current = ev.pointerId;
+    } catch {
+      activePointerId.current = ev.pointerId;
+    }
     const p = clientPoint(ev);
     drawing.current = true;
     setDraft({
@@ -147,33 +189,55 @@ export function SessionWhiteboard({
   }
 
   function onPointerMove(ev: React.PointerEvent<HTMLCanvasElement>) {
-    if (!drawing.current || readOnly || !draft) return;
+    if (!drawing.current || readOnly) return;
     const p = clientPoint(ev);
     setDraft((d) => (d ? { ...d, points: [...d.points, p] } : d));
   }
 
   function onPointerUp(ev: React.PointerEvent<HTMLCanvasElement>) {
-    if (!drawing.current || !draft) return;
-    drawing.current = false;
-    try {
-      ev.currentTarget.releasePointerCapture(ev.pointerId);
-    } catch {
-      /* ignore */
-    }
-    const finished = { ...draft, points: draft.points };
-    if (finished.points.length >= 2) {
-      setStrokes((prev) => [...prev, finished]);
-      if (socket?.connected) {
-        socket.emit(ClientToServerEvents.WB_STROKE, { sessionId, stroke: finished } satisfies WhiteboardStrokePayload);
-      }
-    }
-    setDraft(null);
+    if (!drawing.current) return;
+    finishStroke(ev);
   }
+
+  React.useEffect(() => {
+    if (readOnly) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const toCanvasEvent = (ev: PointerEvent): React.PointerEvent<HTMLCanvasElement> =>
+      ({
+        pointerId: ev.pointerId,
+        currentTarget: canvas,
+        clientX: ev.clientX,
+        clientY: ev.clientY,
+      }) as unknown as React.PointerEvent<HTMLCanvasElement>;
+
+    const move = (ev: PointerEvent) => {
+      if (!drawing.current || readOnly) return;
+      if (activePointerId.current != null && ev.pointerId !== activePointerId.current) return;
+      const p = clientPoint(toCanvasEvent(ev));
+      setDraft((d) => (d && drawing.current ? { ...d, points: [...d.points, p] } : d));
+    };
+    const up = (ev: PointerEvent) => {
+      if (activePointerId.current != null && ev.pointerId !== activePointerId.current) return;
+      if (!drawing.current) return;
+      finishStroke(toCanvasEvent(ev));
+    };
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+    };
+  }, [readOnly, finishStroke]);
 
   function clearBoard() {
     setStrokes([]);
     setDraft(null);
-    if (socket?.connected) {
+    if (socket?.connected && socketSubscribed) {
       socket.emit(ClientToServerEvents.WB_CLEAR, { sessionId });
     }
   }
@@ -239,16 +303,26 @@ export function SessionWhiteboard({
         </Button>
         <span
           className="w-full min-w-0 text-[11px] leading-snug text-muted-foreground sm:w-auto sm:max-w-[14rem] sm:truncate"
-          title={!connected ? "Drawing stays on this device until you run npm run dev:realtime." : "Strokes sync live over the socket server."}
+          title={
+            !connected
+              ? "Connect to the realtime server to sync strokes with your partner."
+              : !socketSubscribed
+                ? "Joining session room…"
+                : "Strokes sync live over the socket server."
+          }
         >
-          {!connected ? "Local strokes only — start dev:realtime to sync." : "Live sync on"}
+          {!connected
+            ? "Local only — realtime offline."
+            : !socketSubscribed
+              ? "Joining room…"
+              : "Live sync on"}
         </span>
       </div>
       <div
         ref={wrapRef}
         className={cn(
           "relative w-full min-w-0 overflow-hidden rounded-xl border border-border/70 bg-white dark:bg-muted/25",
-          isFullscreen ? "min-h-0 flex-1" : "aspect-[5/3] max-h-[min(52vh,420px)]",
+          isFullscreen ? "min-h-0 flex-1" : "aspect-[5/3] min-h-[200px] max-h-[min(52vh,420px)] w-full",
         )}
       >
         <canvas
