@@ -1,0 +1,685 @@
+// LearnLoop — production-oriented schema
+// WHY: Single Postgres database as system of record; Prisma for typed access + migrations.
+// WHY: Microcredit integer storage avoids floating-point money bugs (store as BigInt micro-units).
+// WHY: Append-only `Transaction` rows provide audit-friendly credit history (never mutate past rows).
+// WHY: Soft delete on `User` preserves referential integrity for sessions/messages for compliance.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Enums — WHY: DB-enforced state machines reduce “impossible states” vs free strings.
+// -----------------------------------------------------------------------------
+
+enum UserRole {
+  STUDENT
+  TUTOR
+  ADMIN
+  MODERATOR
+}
+
+enum HelpRequestStatus {
+  DRAFT
+  OPEN
+  MATCHED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  EXPIRED
+}
+
+enum SessionStatus {
+  SCHEDULED
+  ACTIVE
+  ENDED
+  ABANDONED
+  DISPUTED
+}
+
+enum MessageType {
+  TEXT
+  SYSTEM
+  FILE
+}
+
+/// Ledger entry kinds — WHY: Explicit vocabulary for holds vs settlement vs adjustments.
+enum TransactionType {
+  HOLD
+  RELEASE
+  DEBIT
+  CREDIT
+  ADJUSTMENT
+  REFUND
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+}
+
+enum NotificationStatus {
+  UNREAD
+  READ
+  ARCHIVED
+}
+
+enum BookmarkType {
+  HELP_REQUEST
+  TUTOR_PROFILE
+  SESSION
+}
+
+enum LeaderboardScope {
+  CAMPUS
+  GLOBAL
+}
+
+enum LeaderboardWindow {
+  WEEKLY
+  MONTHLY
+  ALL_TIME
+}
+
+enum PresenceStatus {
+  ONLINE
+  AWAY
+  BUSY
+  OFFLINE
+}
+
+enum AITagEntityKind {
+  HELP_REQUEST
+  USER_PROFILE
+  SESSION_SUMMARY
+  STUDY_ROADMAP
+}
+
+enum StudyRoadmapStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum SessionSummaryStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+// -----------------------------------------------------------------------------
+// User aggregate — WHY: `clerkUserId` is the stable external identity key from Clerk.
+// -----------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(cuid())
+  clerkUserId  String    @unique /// Clerk `sub` — unique bridge for auth/webhooks.
+  email        String? /// Clerk-synced; use `citext` + migration later if case-insensitive uniqueness is required at DB layer.
+  role         UserRole  @default(STUDENT)
+  /// Soft delete — WHY: Hard deletes break audit chains for credits/sessions.
+  deletedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  profile       Profile?
+  tutorProfile  TutorProfile?
+  wallet        CreditWallet?
+
+  authoredRequests HelpRequest[] @relation("RequestAuthor")
+  tutorRequests    HelpRequest[] @relation("AcceptedTutor")
+
+  studentSessions Session[] @relation("StudentSessions")
+  tutorSessions   Session[] @relation("TutorSessions")
+
+  messagesSent Message[]
+
+  ratingsGiven    Rating[] @relation("RatingsGiven")
+  ratingsReceived Rating[] @relation("RatingsReceived")
+
+  notifications Notification[]
+
+  achievements UserAchievement[]
+
+  transactionsInitiated Transaction[] @relation("TxActor")
+
+  bookmarks Bookmark[]
+
+  roadmaps StudyRoadmap[]
+
+  leaderboardStats LeaderboardStats[]
+
+  presence UserPresence?
+
+  requestInterests HelpRequestInterest[]
+
+  contentReports ContentReport[]
+
+  @@index([createdAt])
+  @@index([role, deletedAt])
+  @@map("users")
+}
+
+// -----------------------------------------------------------------------------
+// Profile — WHY: Separated from `User` so PII/display fields can evolve independently of auth.
+// -----------------------------------------------------------------------------
+
+model Profile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  displayName String
+  bio         String?  @db.Text
+  avatarUrl   String?
+  locale      String   @default("en")
+  timezone    String? /// IANA tz for scheduling UX.
+
+  /// Campus / org slice — WHY: Leaderboards + verification often scoped by institution.
+  campusSlug String?
+
+  /// Subject tags the learner cares about (JSON string array) — WHY: Flexible taxonomy pre-`Subject` table.
+  learningSubjectSlugs Json @default("[]")
+
+  /// Languages spoken — JSON array of BCP-47 codes.
+  languages Json @default("[]")
+
+  onboardingCompletedAt DateTime?
+
+  /// Submitted `.edu` / institution email for campus verification (reviewed async in production).
+  institutionVerificationEmail String?
+  institutionVerifiedAt          DateTime?
+
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([campusSlug])
+  @@index([onboardingCompletedAt])
+  @@map("profiles")
+}
+
+// -----------------------------------------------------------------------------
+// TutorProfile — WHY: Tutor-specific marketplace fields stay out of generic `Profile`.
+// -----------------------------------------------------------------------------
+
+model TutorProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  headline              String
+  /// Slugs for subjects taught — WHY: Fast filtering without join explosion before dedicated Subject table.
+  teachingSubjectSlugs  Json     @default("[]")
+  /// Denormalized aggregates — WHY: Read-heavy tutor cards avoid N+1 aggregates at scale.
+  completedSessionCount Int    @default(0)
+  averageRating         Decimal? @db.Decimal(3, 2)
+  totalRatingsCount     Int      @default(0)
+
+  isAcceptingRequests Boolean @default(true)
+  /// Verification — WHY: Trust gating for high-stakes matching.
+  verificationStatus  String  @default("NONE") /// NONE | PENDING | VERIFIED | REJECTED
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isAcceptingRequests])
+  @@index([averageRating])
+  @@map("tutor_profiles")
+}
+
+// -----------------------------------------------------------------------------
+// CreditWallet — WHY: One wallet per user; balance updated ONLY with ledger rows in same txn.
+// -----------------------------------------------------------------------------
+
+model CreditWallet {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Micro-credits — WHY: Integer math; display divides by 1_000_000 in app layer if desired.
+  balanceMicrocredits BigInt @default(0)
+
+  /// Optimistic concurrency — WHY: Detect concurrent wallet updates under load.
+  version Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions Transaction[]
+
+  @@map("credit_wallets")
+}
+
+// -----------------------------------------------------------------------------
+// Transaction (append-only ledger) — WHY: Financial events must be immutable + idempotent.
+// -----------------------------------------------------------------------------
+
+model Transaction {
+  id       String @id @default(cuid())
+  walletId String
+  wallet   CreditWallet @relation(fields: [walletId], references: [id], onDelete: Restrict)
+
+  /// Actor who initiated (system jobs use admin user or null policy — here we store actor when known).
+  actorUserId String?
+  actorUser   User?   @relation("TxActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  type   TransactionType
+  /// Signed amount in micro-credits (e.g., CREDIT +5000000, DEBIT -5000000).
+  amountMicrocredits BigInt
+
+  /// Running balance snapshot after this row — WHY: Fast statements without full replay.
+  balanceAfterMicrocredits BigInt
+
+  /// Idempotency — WHY: Retries from mobile / Server Actions must not double-post.
+  idempotencyKey String? @unique
+
+  /// Polymorphic reference — WHY: Traceability to domain object without many nullable FKs.
+  referenceKind String /// HELP_REQUEST | SESSION | ADJUSTMENT | ...
+  referenceId   String?
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([walletId, createdAt(sort: Desc)])
+  @@index([referenceKind, referenceId])
+  @@index([actorUserId, createdAt(sort: Desc)])
+  @@map("transactions")
+}
+
+// -----------------------------------------------------------------------------
+// HelpRequest — WHY: Core marketplace unit; status machine indexed for feed queries.
+// -----------------------------------------------------------------------------
+
+model HelpRequest {
+  id       String @id @default(cuid())
+  authorId String
+  author   User   @relation("RequestAuthor", fields: [authorId], references: [id], onDelete: Restrict)
+
+  title String
+  body  String @db.Text
+
+  subjectSlug String /// Normalized subject key for indexes (AI + manual taxonomy).
+  topicSlug   String? /// Finer-grained topic.
+
+  status HelpRequestStatus @default(DRAFT)
+
+  urgency                 String /// LOW | MEDIUM | HIGH — kept string for product flexibility.
+  preferredDurationMinutes Int
+  language                String /// BCP-47
+
+  /// Credit economics — WHY: Escrow hold ties request lifecycle to ledger.
+  creditHoldTransactionId String? @unique
+
+  acceptedTutorId String?
+  acceptedTutor   User?   @relation("AcceptedTutor", fields: [acceptedTutorId], references: [id], onDelete: SetNull)
+
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  session Session?
+  interests HelpRequestInterest[]
+  aiTags    AITag[]
+
+  /// Feed: `OPEN` ordered by newest (no subject filter) — btree on (status, subjectSlug, createdAt) cannot yield global time order across subjects.
+  @@index([status, createdAt(sort: Desc)])
+  @@index([status, subjectSlug, createdAt(sort: Desc)])
+  @@index([authorId, status, createdAt(sort: Desc)])
+  @@index([acceptedTutorId])
+  @@index([expiresAt])
+  @@map("help_requests")
+}
+
+// -----------------------------------------------------------------------------
+// HelpRequestInterest — WHY: Many tutors may signal intent; fairness + analytics + notifications.
+// -----------------------------------------------------------------------------
+
+model HelpRequestInterest {
+  id         String @id @default(cuid())
+  requestId  String
+  request    HelpRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  tutorUserId String
+  tutor       User       @relation(fields: [tutorUserId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([requestId, tutorUserId])
+  @@index([tutorUserId, createdAt(sort: Desc)])
+  @@map("help_request_interests")
+}
+
+// -----------------------------------------------------------------------------
+// Session — WHY: 1:1 with HelpRequest in v1 keeps matching simple; expand later if needed.
+// -----------------------------------------------------------------------------
+
+model Session {
+  id          String @id @default(cuid())
+  helpRequestId String @unique
+  helpRequest HelpRequest @relation(fields: [helpRequestId], references: [id], onDelete: Restrict)
+
+  studentId String
+  student   User   @relation("StudentSessions", fields: [studentId], references: [id], onDelete: Restrict)
+  tutorId   String
+  tutor     User   @relation("TutorSessions", fields: [tutorId], references: [id], onDelete: Restrict)
+
+  status SessionStatus @default(SCHEDULED)
+
+  startedAt DateTime?
+  endedAt   DateTime?
+
+  /// Tutor asked to go live; learner must confirm before `startedAt` and ACTIVE billing timer begin.
+  startRequestedAt DateTime?
+
+  /// Anti-farming — WHY: Track minimum viable duration signals (product rules enforced in services).
+  minBillableMinutes Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages  Message[]
+  summaries SessionSummary[]
+  ratings   Rating[]
+
+  /// `getMySessions`: participant + `orderBy: updatedAt` (no status filter).
+  @@index([studentId, updatedAt(sort: Desc)])
+  @@index([tutorId, updatedAt(sort: Desc)])
+  /// Profile dashboard: ended sessions in a date window (tutor streak).
+  @@index([tutorId, status, endedAt(sort: Desc)])
+  @@index([tutorId, status, createdAt(sort: Desc)])
+  @@index([studentId, status, createdAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
+  @@map("sessions")
+}
+
+// -----------------------------------------------------------------------------
+// Message — WHY: Chat log; heavy write table → index for session timeline pagination.
+// -----------------------------------------------------------------------------
+
+model Message {
+  id        String @id @default(cuid())
+  sessionId String
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  senderId String
+  sender   User   @relation(fields: [senderId], references: [id], onDelete: Restrict)
+
+  type MessageType @default(TEXT)
+  body String      @db.Text
+
+  /// Client-generated UUID for idempotent sends — WHY: dedupe on flaky networks.
+  clientMessageId String? @unique
+
+  createdAt DateTime @default(now())
+
+  @@index([sessionId, createdAt(sort: Desc)])
+  @@index([senderId, createdAt(sort: Desc)])
+  @@map("messages")
+}
+
+// -----------------------------------------------------------------------------
+// Rating — WHY: One rating per session per rater enforced via unique constraint.
+// -----------------------------------------------------------------------------
+
+model Rating {
+  id        String @id @default(cuid())
+  sessionId String
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  fromUserId String
+  fromUser   User @relation("RatingsGiven", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUserId   String
+  toUser     User @relation("RatingsReceived", fields: [toUserId], references: [id], onDelete: Cascade)
+
+  stars   Int    /// 1-5 enforced in app/service layer (DB check optional via migration SQL).
+  comment String? @db.Text
+
+  createdAt DateTime @default(now())
+
+  @@unique([sessionId, fromUserId])
+  @@index([toUserId, createdAt(sort: Desc)])
+  @@map("ratings")
+}
+
+// -----------------------------------------------------------------------------
+// Community moderation — lightweight reports queue (admin UI can be added later).
+// -----------------------------------------------------------------------------
+
+model ContentReport {
+  id         String @id @default(cuid())
+  reporterId String
+  reporter   User   @relation(fields: [reporterId], references: [id], onDelete: Cascade)
+
+  /// HELP_REQUEST | USER | SESSION
+  targetType String
+  targetId   String
+  reason     String @db.Text
+  /// OPEN | REVIEWED
+  status     String @default("OPEN")
+
+  createdAt DateTime @default(now())
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([targetType, targetId])
+  @@index([reporterId, createdAt(sort: Desc)])
+  @@map("content_reports")
+}
+
+// -----------------------------------------------------------------------------
+// Achievement + pivot — WHY: Badge definitions stable; user pivot grows large → indexed by user.
+// -----------------------------------------------------------------------------
+
+model Achievement {
+  id          String @id @default(cuid())
+  key         String @unique /// Stable machine key e.g. FIRST_SESSION_COMPLETE
+  name        String
+  description String?
+
+  createdAt DateTime @default(now())
+
+  users UserAchievement[]
+
+  @@map("achievements")
+}
+
+model UserAchievement {
+  id            String @id @default(cuid())
+  userId        String
+  user          User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  achievementId String
+  achievement   Achievement @relation(fields: [achievementId], references: [id], onDelete: Cascade)
+
+  earnedAt DateTime @default(now())
+
+  @@unique([userId, achievementId])
+  @@index([userId, earnedAt(sort: Desc)])
+  @@map("user_achievements")
+}
+
+// -----------------------------------------------------------------------------
+// Notification — WHY: In-app inbox; email fan-out can reference same rows with channel field later.
+// -----------------------------------------------------------------------------
+
+model Notification {
+  id      String @id @default(cuid())
+  userId  String
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  channel NotificationChannel @default(IN_APP)
+  status  NotificationStatus @default(UNREAD)
+
+  type String /// e.g. REQUEST_MATCHED — string for extensibility without enum migrations early on.
+  title String
+  body  String @db.Text
+
+  /// Deep-link payload — WHY: Clients route without extra fetch.
+  payload Json?
+
+  readAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, status, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+// -----------------------------------------------------------------------------
+// LeaderboardStats — WHY: Pre-aggregated read model; never compute full sort at request time.
+// -----------------------------------------------------------------------------
+
+model LeaderboardStats {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  scope       LeaderboardScope
+  window      LeaderboardWindow
+  /// e.g. `2026-W19` or `2026-05` — WHY: deterministic partition for upserts.
+  periodKey   String
+  /// Empty string = global / unknown campus — WHY: avoids NULL unique-index ambiguity in Postgres.
+  campusSlug  String @default("")
+
+  points        Int     @default(0)
+  sessionsCount Int     @default(0)
+  creditsEarnedMicro BigInt @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, scope, window, periodKey, campusSlug])
+  @@index([scope, window, periodKey, points(sort: Desc)])
+  @@index([campusSlug, window, periodKey, points(sort: Desc)])
+  @@map("leaderboard_stats")
+}
+
+// -----------------------------------------------------------------------------
+// AITag — WHY: Store AI-extracted labels with provenance for debugging + reruns.
+// -----------------------------------------------------------------------------
+
+model AITag {
+  id String @id @default(cuid())
+
+  /// Polymorphic discriminator — WHY: query tags for any entity without many nullable FK columns early on.
+  entityKind AITagEntityKind
+  entityId   String
+
+  tag        String
+  confidence Decimal? @db.Decimal(4, 3)
+
+  model           String?
+  promptVersion   String?
+  /// Optional direct FK — WHY: faster joins for the common case (request categorization).
+  helpRequestId   String?
+  helpRequest     HelpRequest? @relation(fields: [helpRequestId], references: [id], onDelete: Cascade)
+  sessionSummaryId String?
+  sessionSummary   SessionSummary? @relation(fields: [sessionSummaryId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([entityKind, entityId])
+  @@index([helpRequestId])
+  @@index([sessionSummaryId])
+  @@index([tag])
+  @@map("ai_tags")
+}
+
+// -----------------------------------------------------------------------------
+// SessionSummary — WHY: Async AI artifact; versioned regen without losing audit trail.
+// -----------------------------------------------------------------------------
+
+model SessionSummary {
+  id        String @id @default(cuid())
+  sessionId String
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  status SessionSummaryStatus @default(PENDING)
+
+  /// Markdown or structured JSON string — WHY: Flexible rendering.
+  content String @db.Text
+
+  keyPoints Json @default("[]")
+  model     String?
+  promptVersion String?
+
+  tokensIn  Int?
+  tokensOut Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  aiTags AITag[]
+
+  @@index([sessionId, createdAt(sort: Desc)])
+  @@map("session_summaries")
+}
+
+// -----------------------------------------------------------------------------
+// UserPresence — WHY: Last-write-wins presence row; hot path → minimal columns + upsert.
+// -----------------------------------------------------------------------------
+
+model UserPresence {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status PresenceStatus @default(OFFLINE)
+
+  /// Optional socket connection id for debugging (not authoritative for auth).
+  socketId String?
+
+  lastSeenAt DateTime @default(now())
+
+  @@index([status, lastSeenAt])
+  @@map("user_presence")
+}
+
+// -----------------------------------------------------------------------------
+// Bookmark — WHY: Saved tutors/requests; composite unique prevents dup bookmarks.
+// -----------------------------------------------------------------------------
+
+model Bookmark {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  bookmarkType BookmarkType
+  targetId     String
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, bookmarkType, targetId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("bookmarks")
+}
+
+// -----------------------------------------------------------------------------
+// StudyRoadmap — WHY: AI-generated learning plan is a first-class artifact with lifecycle.
+// -----------------------------------------------------------------------------
+
+model StudyRoadmap {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title  String
+  status StudyRoadmapStatus @default(DRAFT)
+
+  /// Structured steps — WHY: JSON schema validated in Zod at write time.
+  steps Json
+
+  sourceRequestId String? /// Optional lineage to a HelpRequest id.
+
+  aiModel       String?
+  promptVersion String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status, updatedAt(sort: Desc)])
+  @@map("study_roadmaps")
+}

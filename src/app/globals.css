@@ -1,0 +1,143 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  LearnLoop — bold orange accent on clean surfaces (no grid/mesh in app shell).
+*/
+
+@layer base {
+  :root {
+    color-scheme: light;
+    /* Slightly warmer / less “washed” than flat grey-cream */
+    --background: 38 42% 96%;
+    --foreground: 220 22% 7%;
+    --card: 0 0% 100%;
+    --card-foreground: 220 22% 7%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 22% 7%;
+    /* Orange accent — solid CTAs; use /opacity in UI for tinted surfaces */
+    --primary: 24 94% 48%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 32 48% 93%;
+    --secondary-foreground: 220 20% 10%;
+    --muted: 34 40% 94%;
+    --muted-foreground: 220 14% 36%;
+    --accent: 30 72% 93%;
+    --accent-foreground: 220 22% 7%;
+    --destructive: 0 72% 46%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 28 20% 74%;
+    --input: 28 20% 74%;
+    --ring: 24 100% 42%;
+    --glow: 26 100% 52%;
+    --sidebar: 36 40% 97%;
+    --sidebar-foreground: 220 18% 14%;
+    --sidebar-border: 28 18% 80%;
+    /* Light wash behind active nav — keep low chroma so orange fills stay “airy” */
+    --sidebar-accent: 28 65% 93%;
+    --radius-sm: 0.25rem;
+    --radius-md: 0.5rem;
+    --radius-lg: 0.625rem;
+    --radius-xl: 0.75rem;
+  }
+
+  .dark {
+    color-scheme: dark;
+    --background: 28 12% 9%;
+    --foreground: 40 22% 96%;
+    --card: 28 10% 12%;
+    --card-foreground: 40 22% 96%;
+    --popover: 28 10% 11%;
+    --popover-foreground: 40 22% 96%;
+    /* Lighter orange on dark surfaces (was easy to read as “muddy”) */
+    --primary: 28 96% 68%;
+    --primary-foreground: 28 30% 8%;
+    --secondary: 28 10% 16%;
+    --secondary-foreground: 40 18% 92%;
+    --muted: 28 8% 18%;
+    --muted-foreground: 35 12% 68%;
+    --accent: 28 12% 18%;
+    --accent-foreground: 40 22% 96%;
+    --destructive: 0 62% 48%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 30 10% 22%;
+    --input: 30 10% 22%;
+    --ring: 28 92% 62%;
+    --glow: 30 95% 58%;
+    --sidebar: 28 12% 8%;
+    --sidebar-foreground: 36 15% 78%;
+    --sidebar-border: 28 10% 18%;
+    --sidebar-accent: 28 10% 14%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
+  }
+
+  /* Ensure root containers allow vertical scrolling across all pages */
+  html,
+  body,
+  #__next {
+    min-height: 100%;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: auto;
+    touch-action: pan-y;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    html {
+      scroll-behavior: smooth;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .glass {
+    @apply border-2 border-border bg-card shadow-sm;
+  }
+
+  .glass-subtle {
+    @apply border border-border bg-muted/80 shadow-sm;
+  }
+
+  .gradient-border {
+    position: relative;
+    background: hsl(var(--card));
+    border-radius: var(--radius-lg);
+  }
+
+  .gradient-border::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    padding: 1px;
+    border-radius: inherit;
+    background: linear-gradient(135deg, hsl(var(--primary) / 0.2), hsl(var(--glow) / 0.15), transparent);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+}

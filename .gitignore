@@ -1,0 +1,15 @@
+node_modules
+.next
+.turbo
+dist
+.env
+.env*.local
+.vercel
+*.log
+.DS_Store
+coverage
+.idea
+.vscode
+
+# clerk configuration (can include secrets)
+/.clerk/
