@@ -35,6 +35,23 @@ export function SessionWhiteboard({
   const activePointerId = React.useRef<number | null>(null);
   /** Authoritative in-progress stroke (state can lag one frame on pointer-up). */
   const activeDraftRef = React.useRef<Stroke | null>(null);
+  /** Strokes finished while offline or before `session:subscribe` ack — flushed when sync is possible. */
+  const pendingRemoteStrokesRef = React.useRef<Stroke[]>([]);
+
+  const tryFlushPendingRemote = React.useCallback(() => {
+    const s = socket;
+    if (!s?.connected || !socketSubscribed) return;
+    const q = pendingRemoteStrokesRef.current;
+    if (q.length === 0) return;
+    pendingRemoteStrokesRef.current = [];
+    for (const stroke of q) {
+      s.emit(ClientToServerEvents.WB_STROKE, { sessionId, stroke } satisfies WhiteboardStrokePayload);
+    }
+  }, [socket, socketSubscribed, sessionId]);
+
+  React.useEffect(() => {
+    tryFlushPendingRemote();
+  }, [tryFlushPendingRemote, connected, socketSubscribed]);
 
   const redraw = React.useCallback((list: Stroke[], partial: Stroke | null) => {
     const canvas = canvasRef.current;
@@ -44,7 +61,7 @@ export function SessionWhiteboard({
     const w = Math.max(1, Math.floor(rect?.width ?? 320));
     const rectH = rect?.height ?? 0;
     const h =
-      rectH > 96 ? Math.max(1, Math.floor(rectH)) : Math.max(1, Math.floor((rect?.width ?? 320) * 0.55));
+      rectH > 96 ? Math.max(1, Math.floor(rectH)) : Math.max(160, Math.floor((rect?.width ?? 320) * 0.55));
     const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio ?? 1 : 1, 2);
     canvas.width = Math.floor(w * dpr);
     canvas.height = Math.floor(h * dpr);
@@ -131,6 +148,7 @@ export function SessionWhiteboard({
       if (p.sessionId !== sessionId) return;
       setStrokes([]);
       activeDraftRef.current = null;
+      pendingRemoteStrokesRef.current = [];
       setDraft(null);
     };
     socket.on(ServerToClientEvents.WB_STROKE, onRemoteStroke);
@@ -172,12 +190,10 @@ export function SessionWhiteboard({
       if (!snap || snap.points.length < 1) return;
       const finished: Stroke = { ...snap, points: [...snap.points] };
       setStrokes((prev) => [...prev, finished]);
-      const canEmit = socket?.connected && socketSubscribed;
-      if (canEmit) {
-        socket.emit(ClientToServerEvents.WB_STROKE, { sessionId, stroke: finished } satisfies WhiteboardStrokePayload);
-      }
+      pendingRemoteStrokesRef.current.push(finished);
+      tryFlushPendingRemote();
     },
-    [sessionId, socket, socketSubscribed],
+    [sessionId, socket, socketSubscribed, tryFlushPendingRemote],
   );
 
   function onPointerDown(ev: React.PointerEvent<HTMLCanvasElement>) {
@@ -232,6 +248,7 @@ export function SessionWhiteboard({
     const move = (ev: PointerEvent) => {
       if (!drawing.current || readOnly) return;
       if (activePointerId.current != null && ev.pointerId !== activePointerId.current) return;
+      ev.preventDefault();
       const cur = activeDraftRef.current;
       if (!cur) return;
       const p = clientPoint(toCanvasEvent(ev));
@@ -245,7 +262,7 @@ export function SessionWhiteboard({
       finishStroke(toCanvasEvent(ev));
     };
 
-    window.addEventListener("pointermove", move);
+    window.addEventListener("pointermove", move, { passive: false });
     window.addEventListener("pointerup", up);
     window.addEventListener("pointercancel", up);
     return () => {
@@ -259,6 +276,7 @@ export function SessionWhiteboard({
     setStrokes([]);
     activeDraftRef.current = null;
     drawing.current = false;
+    pendingRemoteStrokesRef.current = [];
     setDraft(null);
     if (socket?.connected && socketSubscribed) {
       socket.emit(ClientToServerEvents.WB_CLEAR, { sessionId });
@@ -355,7 +373,10 @@ export function SessionWhiteboard({
             readOnly ? "cursor-default opacity-90" : "cursor-crosshair",
           )}
           onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
+          onPointerMove={(e) => {
+            if (drawing.current) e.preventDefault();
+            onPointerMove(e);
+          }}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
         />

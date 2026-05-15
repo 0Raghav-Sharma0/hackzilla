@@ -23,6 +23,9 @@ const serverSchema = z.object({
   REDIS_URL: z.string().min(1).optional(),
 
   AI_QUEUE_SECRET: z.string().optional(),
+
+  /** JSON array of ICE servers (typically TURN) merged into `/api/v1/realtime/token` — not exposed in NEXT_PUBLIC. */
+  WEBRTC_ICE_SERVERS_JSON: z.string().optional(),
 });
 
 export type ServerEnv = z.infer<typeof serverSchema>;

@@ -4,6 +4,7 @@ import { getServerEnv } from "@/lib/env/server";
 import { AppError } from "@/lib/errors/app-error";
 import { prisma } from "@/lib/db/prisma";
 import { createSocketToken } from "@/lib/realtime/socket-token";
+import { parseIceServersJson } from "@/lib/realtime/webrtc-ice-config";
 
 const bodySchema = z.object({});
 
@@ -32,10 +33,14 @@ export const POST = createApiHandler({
 
     const { token, expiresAtUnix } = createSocketToken(user.id, env.SOCKET_JWT_SECRET, 5 * 60);
 
+    const iceServersFromSecret = parseIceServersJson(env.WEBRTC_ICE_SERVERS_JSON);
+
     return {
       token,
       expiresAt: new Date(expiresAtUnix * 1000).toISOString(),
       socketUrl: env.SOCKET_SERVER_URL,
+      /** TURN (and optional extra STUN) from server env — browser merges with defaults + NEXT_PUBLIC_WEBRTC_ICE_SERVERS. */
+      iceServers: iceServersFromSecret,
     };
   },
 });

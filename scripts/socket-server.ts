@@ -49,7 +49,27 @@ const CORS_ORIGINS = (process.env.SOCKET_CORS_ORIGINS ?? "http://localhost:3000,
   .map((s) => s.trim())
   .filter(Boolean);
 
-/** When Next is opened via LAN IP (e.g. http://192.168.x.x:3000), Origin is not localhost — allow private dev hosts unless SOCKET_CORS_STRICT=1. */
+/** Merge explicit CORS list with common deploy envs so the browser Origin is allowed (socket process may omit NODE_ENV). */
+function resolvedCorsOrigins(): string[] {
+  const out = new Set(CORS_ORIGINS);
+  const vercel = process.env.VERCEL_URL?.trim();
+  if (vercel) {
+    out.add(`https://${vercel}`);
+    out.add(`https://${vercel.replace(/^www\./, "")}`);
+  }
+  for (const key of ["NEXT_PUBLIC_APP_URL", "APP_ORIGIN", "NEXT_PUBLIC_SITE_URL"]) {
+    const raw = process.env[key]?.trim();
+    if (!raw) continue;
+    try {
+      out.add(new URL(raw).origin);
+    } catch {
+      /* ignore */
+    }
+  }
+  return [...out];
+}
+
+const CORS_ORIGINS_RESOLVED = resolvedCorsOrigins();
 function isPermissiveLocalDevOrigin(origin: string | undefined): boolean {
   if (process.env.SOCKET_CORS_STRICT === "1") return false;
   if (process.env.NODE_ENV === "production") return false;
@@ -210,7 +230,7 @@ const httpServer = createServer((req, res) => {
 io = new Server(httpServer, {
   cors: {
     origin(origin, callback) {
-      if (!origin || CORS_ORIGINS.includes(origin)) {
+      if (!origin || CORS_ORIGINS_RESOLVED.includes(origin)) {
         callback(null, true);
         return;
       }

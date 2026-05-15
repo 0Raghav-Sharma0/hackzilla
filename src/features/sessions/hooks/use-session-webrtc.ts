@@ -4,23 +4,7 @@ import * as React from "react";
 import type { Socket } from "socket.io-client";
 import { ClientToServerEvents, ServerToClientEvents } from "@/server/socket/events";
 import type { WebrtcIcePayload, WebrtcPeerReadyPayload, WebrtcSignalPayload } from "@/server/socket/events";
-
-function defaultIceServers(): RTCIceServer[] {
-  const servers: RTCIceServer[] = [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-  ];
-  try {
-    const raw = process.env.NEXT_PUBLIC_WEBRTC_ICE_SERVERS;
-    if (raw) {
-      const extra = JSON.parse(raw) as unknown;
-      if (Array.isArray(extra)) servers.push(...(extra as RTCIceServer[]));
-    }
-  } catch {
-    /* ignore invalid JSON */
-  }
-  return servers;
-}
+import { buildWebRtcIceServers } from "@/lib/realtime/webrtc-ice-config";
 
 export type UseSessionWebrtcOpts = {
   sessionId: string;
@@ -32,6 +16,8 @@ export type UseSessionWebrtcOpts = {
   /** Socket connected + room subscribed — WebRTC signaling only when true; mic/camera still work locally when false. */
   signalingReady: boolean;
   enabled: boolean;
+  /** TURN etc. from `/api/v1/realtime/token` — merged with STUN + NEXT_PUBLIC_WEBRTC_ICE_SERVERS. */
+  iceServersFromToken?: RTCIceServer[];
 };
 
 /**
@@ -39,7 +25,19 @@ export type UseSessionWebrtcOpts = {
  * Uses public STUN; add TURN via NEXT_PUBLIC_WEBRTC_ICE_SERVERS for strict NATs.
  */
 export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
-  const { sessionId, localUserId, remoteUserId, socket, roomSubscribed, signalingReady, enabled } = opts;
+  const { sessionId, localUserId, remoteUserId, socket, roomSubscribed, signalingReady, enabled, iceServersFromToken } = opts;
+
+  const iceServersMerged = React.useMemo(
+    () =>
+      buildWebRtcIceServers({
+        fromTokenApi: iceServersFromToken ?? null,
+        nextPublicJson: process.env.NEXT_PUBLIC_WEBRTC_ICE_SERVERS,
+      }),
+    // Stable when token payload is the same reference-wise; stringify avoids missing TURN after first paint.
+    [JSON.stringify(iceServersFromToken ?? [])],
+  );
+  const iceServersRef = React.useRef(iceServersMerged);
+  iceServersRef.current = iceServersMerged;
   const [voiceActive, setVoiceActive] = React.useState(false);
   const [screenActive, setScreenActive] = React.useState(false);
   const [cameraActive, setCameraActive] = React.useState(false);
@@ -137,7 +135,14 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
 
   const ensurePc = React.useCallback(() => {
     if (pcRef.current) return pcRef.current;
-    const pc = new RTCPeerConnection({ iceServers: defaultIceServers() });
+    const iceServers = iceServersRef.current;
+    const pool = typeof window !== "undefined" && process.env.NODE_ENV === "production" ? 10 : 0;
+    const pc = new RTCPeerConnection({
+      iceServers,
+      iceCandidatePoolSize: pool,
+      bundlePolicy: "max-bundle",
+      rtcpMuxPolicy: "require",
+    });
     pcRef.current = pc;
     pc.onicecandidate = (ev) => {
       emitIce(ev.candidate?.toJSON() ?? null);
@@ -233,7 +238,21 @@ export function useSessionWebrtc(opts: UseSessionWebrtcOpts) {
         pendingOfferSdpRef.current = sdp;
         return;
       }
-      await pc.setRemoteDescription({ type: "offer", sdp });
+      try {
+        await pc.setRemoteDescription({ type: "offer", sdp });
+      } catch (err) {
+        /* Renegotiation / glare: rollback then retry (Chrome unified plan). */
+        try {
+          if (pc.signalingState === "stable") {
+            await pc.setLocalDescription({ type: "rollback" });
+            await pc.setRemoteDescription({ type: "offer", sdp });
+          } else {
+            throw err;
+          }
+        } catch {
+          throw err;
+        }
+      }
       await flushIce(pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);

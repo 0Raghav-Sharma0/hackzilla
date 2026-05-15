@@ -344,7 +344,7 @@ function SessionRoomInner({
             <span className="ml-auto opacity-60">Syncing…</span>
           )}
         </div>
-        <ScrollArea className="min-h-0 min-w-0 flex-1 basis-0 px-3">
+        <ScrollArea className="min-h-[220px] min-w-0 flex-1 basis-0 px-3">
           <div className="space-y-2 py-3">
             <AnimatePresence initial={false}>
               {data.messages.map((m) => (

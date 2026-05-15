@@ -28,15 +28,23 @@ npm run dev:realtime
   - `SOCKET_SERVER_URL` -> e.g. `https://realtime.example.com` (use `wss`/`https` depending on your proxy)
   - `SOCKET_JWT_SECRET` -> same secret used by Next API to sign short-lived tokens
   - `SOCKET_INTERNAL_SECRET` -> secret for internal POST endpoints (`/internal/*`)
-  - `SOCKET_CORS_ORIGINS` -> comma list of allowed origins
-  - `NEXT_PUBLIC_WEBRTC_ICE_SERVERS` -> JSON array of RTCIceServer objects (include TURN)
+  - `SOCKET_CORS_ORIGINS` -> comma list of allowed origins (your exact Next site URL, e.g. `https://app.example.com`)
+  - **TURN (required for most real-world networks):** set `WEBRTC_ICE_SERVERS_JSON` on the **Next** server to a JSON array of `RTCIceServer` objects. It is returned from `/api/v1/realtime/token` as `iceServers` and merged with Google STUN in the browser. Prefer this over `NEXT_PUBLIC_WEBRTC_ICE_SERVERS` so TURN passwords are not in the client bundle.
+- The socket sidecar also auto-allows `https://${VERCEL_URL}` and origins from `NEXT_PUBLIC_APP_URL` / `APP_ORIGIN` / `NEXT_PUBLIC_SITE_URL` when those env vars are set on the **socket** process (in addition to `SOCKET_CORS_ORIGINS`).
 
-Example `NEXT_PUBLIC_WEBRTC_ICE_SERVERS` value (use your TURN provider credentials):
+Optional client-only ICE (build-time):
+
+```text
+NEXT_PUBLIC_WEBRTC_ICE_SERVERS=[{"urls":"turn:turn.example.com:3478","username":"turnuser","credential":"turnpass"}]
+```
+
+Example `WEBRTC_ICE_SERVERS_JSON` (same JSON shape, server env on Vercel/hosting):
+
 ```text
 [{"urls":"turn:turn.example.com:3478","username":"turnuser","credential":"turnpass"}]
 ```
 
-Why TURN matters: STUN alone fails for strict NATs; add a TURN server for reliable audio/video in production.
+Why TURN matters: STUN alone fails for strict NATs and many mobile networks; without TURN, remote camera/audio often never connects in production.
 
 4) Reverse proxy / TLS
 - Terminate TLS at a proxy (nginx, cloud load balancer) and forward WebSocket / Socket.IO traffic to the socket server. Ensure `socketUrl` returned by `/api/v1/realtime/token` matches the public socket endpoint.
@@ -48,11 +56,9 @@ Why TURN matters: STUN alone fails for strict NATs; add a TURN server for reliab
 6) Debugging steps
 - Locally: open browser console and observe console logs from `socket-io-provider` connect/connect_error.
 - Server side: `npx tsx scripts/socket-server.ts` prints listen address and CORS rejections.
-- If media never negotiates: check `NEXT_PUBLIC_WEBRTC_ICE_SERVERS` (TURN) and verify `socketUrl` + token exchange succeed.
+- If media never negotiates: set **`WEBRTC_ICE_SERVERS_JSON`** (TURN) on Next, confirm `SOCKET_CORS_ORIGINS` includes your live site origin (or rely on `VERCEL_URL` / `NEXT_PUBLIC_APP_URL` auto-merge), and verify `socketUrl` + token exchange succeed.
 
 7) Quick test sequence
 - Start `npm run dev:realtime`
 - Open two browser windows (different accounts or incognito), join the same session, enable Mic on both, confirm audio and remote video element receives stream.
 - Draw on whiteboard in one client and verify stroke appears in the other.
-
-If you'd like, I can: (A) add a small README snippet to the Session page, (B) add runtime checks that warn users if ICE/Socket config is missing, or (C) wire a TURN provider sample. Which would you prefer?

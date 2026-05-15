@@ -8,6 +8,8 @@ import { ServerToClientEvents } from "@/server/socket/events";
 type SocketIoContextValue = {
   connected: boolean;
   socket: Socket | null;
+  /** ICE servers from realtime token (TURN etc.) — merged in WebRTC hook with STUN + NEXT_PUBLIC_WEBRTC_ICE_SERVERS. */
+  webRtcIceServers: RTCIceServer[] | undefined;
 };
 
 const SocketIoContext = React.createContext<SocketIoContextValue | null>(null);
@@ -16,6 +18,7 @@ export function SocketIoProvider({ children }: { children: React.ReactNode }) {
   const qc = useQueryClient();
   const [connected, setConnected] = React.useState(false);
   const [socket, setSocket] = React.useState<Socket | null>(null);
+  const [webRtcIceServers, setWebRtcIceServers] = React.useState<RTCIceServer[] | undefined>(undefined);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -28,8 +31,14 @@ export function SocketIoProvider({ children }: { children: React.ReactNode }) {
         headers: { "content-type": "application/json" },
         body: "{}",
       });
-      const json = (await res.json()) as { ok?: boolean; data?: { token: string; socketUrl: string } };
+      const json = (await res.json()) as {
+        ok?: boolean;
+        data?: { token: string; socketUrl: string; iceServers?: RTCIceServer[] };
+      };
       if (cancelled || !json.ok || !json.data?.token || !json.data.socketUrl) return;
+
+      const ice = Array.isArray(json.data.iceServers) ? json.data.iceServers : [];
+      setWebRtcIceServers(ice);
 
       s = io(json.data.socketUrl, {
         transports: ["polling", "websocket"],
@@ -42,9 +51,7 @@ export function SocketIoProvider({ children }: { children: React.ReactNode }) {
       s.on("connect", () => setConnected(true));
       s.on("disconnect", () => setConnected(false));
       s.on("connect_error", (err) => {
-        if (process.env.NODE_ENV === "development") {
-          console.warn("[socket] connect_error:", err.message);
-        }
+        console.warn("[socket] connect_error:", err.message);
       });
 
       s.on(ServerToClientEvents.RT_INVALIDATE, (payload: { keys?: (string | number)[][] }) => {
@@ -66,10 +73,14 @@ export function SocketIoProvider({ children }: { children: React.ReactNode }) {
       }
       setSocket(null);
       setConnected(false);
+      setWebRtcIceServers(undefined);
     };
   }, [qc]);
 
-  const value = React.useMemo(() => ({ connected, socket }), [connected, socket]);
+  const value = React.useMemo(
+    () => ({ connected, socket, webRtcIceServers }),
+    [connected, socket, webRtcIceServers],
+  );
 
   return <SocketIoContext.Provider value={value}>{children}</SocketIoContext.Provider>;
 }

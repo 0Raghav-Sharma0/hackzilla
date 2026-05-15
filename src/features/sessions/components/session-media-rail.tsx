@@ -26,7 +26,7 @@ export function SessionMediaRail({
   viewerId,
   peerUserId,
 }: SessionMediaRailProps) {
-  const { socket, connected } = useSocketIo();
+  const { socket, connected, webRtcIceServers } = useSocketIo();
   const signalingReady = sessionOpen && connected && sessionSubscribed;
 
   const webrtc = useSessionWebrtc({
@@ -37,6 +37,7 @@ export function SessionMediaRail({
     roomSubscribed: sessionSubscribed,
     signalingReady,
     enabled: sessionOpen,
+    iceServersFromToken: webRtcIceServers,
   });
 
   const mainVideoRef = React.useRef<HTMLVideoElement>(null);
